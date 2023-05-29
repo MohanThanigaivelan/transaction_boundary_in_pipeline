@@ -1,0 +1,68 @@
+Scenario:
+Pipelining multiple queries causes implicit transaction to open for longer duration and it leads to consequences
+such as unable to execute DDL commands .
+
+Approach:
+Auto-Detecting transaction boundary and closing transaction in background thread when results of all submitted
+queries gets processed.
+
+Implementation detail:
+1. Main thread does
+    a. sends query to the database server
+    b. does send_flush_request which tells the database server to start sending results back to the client
+       when available.
+    c. creates FutureResult object and pushes it to the queue
+2. Background thread does
+    a. gets the result from the connection.
+    b. assign success/error results to the FutureResult object.
+    c. unhandled exception to be reported to main thread upon query failure and transaction should be kept open.
+    d. closes the implicit transaction when queue is empty upon success result.
+
+We can use a shared lock between the threads to ensure that a race condition doesn't happen. We don't want to
+read the results in the background thread before the future result is pushed to the queue.
+
+get_result is a blocking call and we don't want to hold the execution in the background thread until a result is available.
+Instead, we make use of is_busy( which is non blocking ) to know if the results are available.
+
+Preventing the execution of subsequent queries
+
+1. Before submission of next query, if background thread gets the error result , exception will be reported to main
+thread and main thread raises exception without executing further queries
+2. If main thread submits multiple queries before processing the query failure, all subsequent queries will fail because
+the implicit transaction remains open.
+
+Callouts:
+1. Background thread runs unnecessarily till end of main thread even though there are no queries in pipeline.
+2. If main thread continuously sends multiple queries without any intermittent non-DB related actions,
+   then implicit transaction may be long lived.[Rare scenario]
+
+
+
+
+
+
+
+
+Questions:
+1. When to spin up the background thread?
+2. How many threads need to be created per action (decide based on context of sharding)?
+3.
+
+
+
+Background thread should wait to process results till the main thread pushes the FutureResult to the queue. And also
+main thread shouldn't submit more queries till background thread assigns success/error results to the FutureResult
+object. We have to implement a locking mechanism so main thread waits if lock is obtained by background thread and
+vice-versa
+
+When result is not available in the client, get_result call will block till result becomes available. Since we lock
+the get_result, in the main thread submission of queries is not possible until the lock is released. This leads to
+executing the queries in more synchronous fashion. In order to prevent from this, obtain the lock in the
+background thread only when result is available.
+
+Question: How to know when results becomes available in client side ?
+PG gem provides two methods namely consume_input and is_busy. After calling consume_input method, if is_busy method
+returns true means results are not available
+
+If is_busy method returns false, then obtain lock in the background thread and get the results. On doing this, we
+allow the main thread to send query if result is not available.
